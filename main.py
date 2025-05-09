@@ -44,13 +44,6 @@ app.include_router(schedule.router, prefix="/schedule", tags=["Schedule"])
 app.include_router(excel.router, prefix="/upload", tags=["Excel Upload"])
 app.include_router(overrides.router, prefix="/override", tags=["Overrides"])
 
-@app.get("/", tags=["Root"])
-async def root():
-    return {
-        "message": "Welcome to OptiSchedule API",
-        "docs_url": "/docs",
-        "version": "1.0.0"
-    }
 
 @app.on_event("startup")
 async def startup_event():
