@@ -1,24 +1,11 @@
-import os
-import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from app.core.globals import schedule_dict, in_memory_faculty_loads
 
-# Check if running on Render (environment variable exists)
-firebase_creds_env = os.environ.get('FIREBASE_CREDENTIALS')
-
-if firebase_creds_env:
-    # Parse JSON string from environment variable
-    cred_dict = json.loads(firebase_creds_env)
-    cred = credentials.Certificate(cred_dict)
-else:
-    # Local development - use file
-    cred = credentials.Certificate("optisched-6b881-firebase-adminsdk-fbsvc-61c4234df0.json")
-
+cred = credentials.Certificate("optisched-6b881-firebase-adminsdk-fbsvc-61c4234df0.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Rest of your code remains the same
 _courses_cache = None
 _rooms_cache = None
 _time_settings_cache = None
@@ -26,7 +13,6 @@ _days_cache = None
 _faculty_cache = None
 _admins_cache: set[str] = set()
 
-# ... rest of your functions ...
 
 def get_start_end(period_str: str):
     def parse_time(t: str) -> int:
