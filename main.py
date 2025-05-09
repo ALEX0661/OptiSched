@@ -59,6 +59,13 @@ async def startup_event():
             ev["start"] = start
             ev["end"] = end
 
+@app.get("/", tags=["Root"])
+async def root():
+    return {
+        "message": "Welcome to OptiSchedule API",
+        "docs_url": "/docs",
+        "version": "1.0.0"
+    }
 
 if __name__ == "__main__":
     import uvicorn
