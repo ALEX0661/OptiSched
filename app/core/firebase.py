@@ -2,7 +2,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from app.core.globals import schedule_dict, in_memory_faculty_loads
 
-cred = credentials.Certificate("optisched-6b881-firebase-adminsdk-fbsvc-61c4234df0.json")
+cred = credentials.ApplicationDefault()
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
