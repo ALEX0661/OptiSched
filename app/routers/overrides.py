@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from app.core.auth import verify_token_allowed
 from app.core.firebase import get_start_end
 from app.utils.helper import format_period
@@ -19,12 +19,23 @@ async def override_event(request: OverrideRequest):
         fixed_duration = 90 if event["session"] == "Laboratory" else 60
         try:
             parts = request.new_start.split(":")
+            if len(parts) != 2:
+                raise ValueError("Invalid time format: must be HH:MM")
             new_start_minutes = int(parts[0]) * 60 + int(parts[1])
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid time format")
+            if new_start_minutes < 0 or new_start_minutes >= 24 * 60:
+                raise ValueError("Start time out of valid range (00:00-23:59)")
+        except ValueError as ve:
+            logger.error(f"Invalid time format in override_event: {str(ve)}")
+            raise HTTPException(status_code=400, detail=f"Invalid time format: {str(ve)}")
     
         new_end_minutes = new_start_minutes + fixed_duration
         new_day = request.new_day if request.new_day and request.new_day.lower() != "auto" else event.get("day")
+    
+        # Validate new_day
+        valid_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        if new_day and new_day not in valid_days:
+            logger.error(f"Invalid day in override_event: {new_day}")
+            raise HTTPException(status_code=400, detail=f"Invalid day: {new_day}")
     
         # Detect overlaps but allow saving
         overlap_details = {"hasOverlap": False, "reasons": [], "conflictingEvents": []}
@@ -39,11 +50,14 @@ async def override_event(request: OverrideRequest):
                 e.get("year") == event.get("year") and 
                 e.get("day") == new_day
             ):
-                e_start, e_end = get_start_end(e["period"])
-                if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
-                    overlap_details["hasOverlap"] = True
-                    overlap_details["reasons"].append("time_program")
-                    overlap_details["conflictingEvents"].append(e["schedule_id"])
+                try:
+                    e_start, e_end = get_start_end(e["period"])
+                    if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
+                        overlap_details["hasOverlap"] = True
+                        overlap_details["reasons"].append("time_program")
+                        overlap_details["conflictingEvents"].append(e["schedule_id"])
+                except Exception as e:
+                    logger.warn(f"Invalid period in conflicting event {e['schedule_id']}: {e.get('period')}")
         
         # Check for faculty time overlap
         if event.get("faculty"):
@@ -51,27 +65,37 @@ async def override_event(request: OverrideRequest):
                 if e["schedule_id"] == request.schedule_id:
                     continue
                 if e.get("day") == new_day and e.get("faculty") == event.get("faculty"):
-                    e_start, e_end = get_start_end(e["period"])
-                    if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
-                        overlap_details["hasOverlap"] = True
-                        if "time_faculty" not in overlap_details["reasons"]:
-                            overlap_details["reasons"].append("time_faculty")
-                        overlap_details["conflictingEvents"].append(e["schedule_id"])
+                    try:
+                        e_start, e_end = get_start_end(e["period"])
+                        if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
+                            overlap_details["hasOverlap"] = True
+                            if "time_faculty" not in overlap_details["reasons"]:
+                                overlap_details["reasons"].append("time_faculty")
+                            overlap_details["conflictingEvents"].append(e["schedule_id"])
+                    except Exception as e:
+                        logger.warn(f"Invalid period in conflicting event {e['schedule_id']}: {e.get('period')}")
         
         # Check for room overlap
         for e in schedule_dict.values():
             if e["schedule_id"] == request.schedule_id:
                 continue
             if e.get("day") == new_day and e.get("room") == request.new_room:
-                e_start, e_end = get_start_end(e["period"])
-                if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
-                    overlap_details["hasOverlap"] = True
-                    if "room" not in overlap_details["reasons"]:
-                        overlap_details["reasons"].append("room")
-                    overlap_details["conflictingEvents"].append(e["schedule_id"])
+                try:
+                    e_start, e_end = get_start_end(e["period"])
+                    if not (new_end_minutes <= e_start or new_start_minutes >= e_end):
+                        overlap_details["hasOverlap"] = True
+                        if "room" not in overlap_details["reasons"]:
+                            overlap_details["reasons"].append("room")
+                        overlap_details["conflictingEvents"].append(e["schedule_id"])
+                except Exception as e:
+                    logger.warn(f"Invalid period in conflicting event {e['schedule_id']}: {e.get('period')}")
         
         # Update the event
         new_period = format_period(request.new_start, fixed_duration)
+        if not new_period or not isinstance(new_period, str):
+            logger.error(f"Invalid period generated: {new_period}")
+            raise HTTPException(status_code=500, detail="Failed to generate valid period")
+        
         event["period"] = new_period
         event["room"] = request.new_room
         event["day"] = new_day
