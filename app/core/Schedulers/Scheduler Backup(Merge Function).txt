@@ -1,0 +1,514 @@
+from ortools.sat.python import cp_model
+from collections import defaultdict
+from app.core.globals import schedule_dict, progress_state
+from app.core.firebase import load_courses, load_rooms, load_time_settings, load_days
+import logging
+import math
+import random # <--- Ensures random is imported
+from typing import List, Dict, Tuple, Set, Optional
+from enum import Enum
+import time
+
+logger = logging.getLogger("schedgeneration")
+
+class SchedulingPhase(Enum):
+    YEAR_1 = 1
+    YEAR_2 = 2
+    YEAR_3 = 3
+    YEAR_4 = 4
+
+class HierarchicalScheduler:
+    """
+    Year-level hierarchical scheduler.
+    Implements room sharing for 1st year lectures and GEC lectures,
+    with room consistency across hours for merged groups.
+    """
+    
+    def __init__(self, process_id=None):
+        self.process_id = process_id
+        self.all_courses = []
+        self.rooms = {} # Will store {'lecture': [...], 'lab': [...]}
+        self.time_settings = {}
+        self.days = []
+        
+        # Time parameters
+        self.start_t = 0
+        self.end_t = 0
+        self.inc_hr = 2
+        self.inc_day = 0
+        self.total_inc = 0
+        self.lab_starts = []
+        
+        # Schedule tracking across phases
+        self.global_schedule = []
+        self.occupied_slots = defaultdict(set) # Tracks (room_type, room_idx) -> set of occupied time slots
+        self.section_occupied = defaultdict(set) # Tracks (program, year, block) -> set of occupied time slots
+        
+        self.schedule_id_counter = 1 # Use a counter to ensure unique IDs
+        self.phase_stats = {}
+        
+        # Track courses with both lecture and lab units
+        self.courses_with_both = set()
+        
+    def _get_next_schedule_id(self):
+        """Helper to get a unique ID for each session variable group"""
+        id_val = self.schedule_id_counter
+        self.schedule_id_counter += 1
+        return id_val
+
+    def update_progress(self, value):
+        if self.process_id:
+            progress_state[self.process_id] = value
+            
+    def get_year_level_room_indices(self, year_level, room_type):
+        """Returns indices for ALL rooms of the specified type."""
+        all_rooms_of_type = self.rooms.get(room_type, [])
+        return list(range(len(all_rooms_of_type)))
+
+    def load_data(self):
+        self.update_progress(5)
+        courses = load_courses()
+        self.all_courses = self.prioritize_and_partition_courses(courses)
+        self.update_progress(15)
+        self.rooms = load_rooms()
+        for room_type in self.rooms:
+             random.shuffle(self.rooms[room_type])
+        self.update_progress(25)
+        self.update_progress(30) # Keep progress step
+        self.time_settings = load_time_settings()
+        self.update_progress(35)
+        self.days = load_days()
+        self.update_progress(45)
+        self.setup_time_parameters()
+        self.update_progress(50)
+        
+    def prioritize_and_partition_courses(self, courses):
+        year_courses = defaultdict(list)
+        for course in courses:
+            has_lecture = course.get('unitsLecture', 0) > 0
+            has_lab = course.get('unitsLab', 0) > 0
+            if has_lecture and has_lab:
+                self.courses_with_both.add(course['courseCode'])
+            year_level = course['yearLevel']
+            priority_score = (
+                (0 if not has_lab else 1000) +
+                course.get('blocks', 1) * 100 +
+                (course.get('unitsLecture', 0) + course.get('unitsLab', 0)) * 10
+            )
+            year_courses[year_level].append((priority_score, course))
+            
+        result = []
+        phase_map = {1: SchedulingPhase.YEAR_1, 2: SchedulingPhase.YEAR_2, 3: SchedulingPhase.YEAR_3, 4: SchedulingPhase.YEAR_4}
+        for year_level in sorted(year_courses.keys()):
+            phase = phase_map.get(year_level, SchedulingPhase.YEAR_1)
+            courses_list = year_courses[year_level]
+            courses_list.sort(key=lambda x: x[0])
+            for _, course in courses_list:
+                result.append((phase, course))
+        return result
+    
+    def setup_time_parameters(self):
+        self.start_t = self.time_settings["start_time"]
+        self.end_t = self.time_settings["end_time"]
+        self.inc_hr = 2
+        self.inc_day = (self.end_t - self.start_t) * self.inc_hr
+        self.total_inc = self.inc_day * len(self.days)
+        self.lab_starts = []
+        for d in range(len(self.days)):
+            base = d * self.inc_day
+            self.lab_starts.extend(range(base, base + self.inc_day - 2)) # Ensure lab ends within the day
+    
+    def get_available_time_slots(self, section_key, duration, is_lab=False, max_slots=500):
+        occupied = self.section_occupied.get(section_key, set())
+        available_starts = []
+        search_space = self.lab_starts if is_lab else range(self.total_inc - duration + 1)
+        for start in search_space:
+            slots_needed = set(range(start, start + duration))
+            if not slots_needed.intersection(occupied):
+                available_starts.append(start)
+                if len(available_starts) >= max_slots: break
+        return available_starts
+    
+    def get_phase_timeout(self, phase_num, total_phases, phase_difficulty):
+        base_times = [t * 1.2 for t in [120, 180, 240, 300]]
+        timeout = base_times[phase_num - 1] if phase_num <= len(base_times) else 360
+        return max(60, int(timeout * phase_difficulty))
+    
+    def calculate_phase_difficulty(self, phase_courses):
+        if not phase_courses: return 0.5
+        total_units = sum(c.get('unitsLecture', 0) + c.get('unitsLab', 0) * 2 for c in phase_courses)
+        total_blocks = sum(c.get('blocks', 1) for c in phase_courses)
+        avg_units = total_units / len(phase_courses) if phase_courses else 0
+        avg_blocks = total_blocks / len(phase_courses) if phase_courses else 0
+        difficulty = (avg_units / 5.0) * (avg_blocks / 1.5)
+        return max(0.5, min(2.0, difficulty))
+    
+    def solve_phase(self, phase_courses, phase_num, total_phases, year_level):
+        if not phase_courses: return []
+        phase_difficulty = self.calculate_phase_difficulty(phase_courses)
+        timeout = self.get_phase_timeout(phase_num, total_phases, phase_difficulty)
+        logger.info(f"Phase {phase_num}/{total_phases} (Year {year_level}): Processing {len(phase_courses)} courses (difficulty: {phase_difficulty:.2f}, timeout: {timeout}s)")
+        
+        result = self._solve_phase_attempt(phase_courses, phase_num, total_phases, timeout, optimize=False, year_level=year_level)
+        if result is not None:
+            logger.info(f"Phase {phase_num} (Year {year_level}) completed (feasibility mode)")
+            return result
+        
+        logger.warning(f"Phase {phase_num} (Year {year_level}) feasibility failed, retrying with objectives...")
+        result = self._solve_phase_attempt(phase_courses, phase_num, total_phases, int(timeout * 1.5), optimize=True, year_level=year_level)
+        if result is not None:
+            logger.info(f"Phase {phase_num} (Year {year_level}) completed (optimization mode)")
+            return result
+            
+        logger.error(f"Phase {phase_num} (Year {year_level}) failed completely")
+        return None
+    
+    def _solve_phase_attempt(self, phase_courses, phase_num, total_phases, timeout, optimize=True, year_level=1):
+        model = cp_model.CpModel()
+        solver = cp_model.CpSolver()
+        phase_sessions = []
+        section_intervals = defaultdict(list)
+        room_intervals = defaultdict(list)
+        
+        # Add fixed intervals for already occupied slots from PREVIOUS phases
+        for (room_type, room_idx), slots in self.occupied_slots.items():
+            if not slots: continue
+            sorted_slots = sorted(list(slots))
+            start_slot = sorted_slots[0]; current_slot = sorted_slots[0]
+            for slot in sorted_slots[1:]:
+                if slot == current_slot + 1: current_slot = slot
+                else:
+                    duration = (current_slot - start_slot) + 1
+                    fixed_interval = model.NewFixedSizeIntervalVar(start_slot, duration, f"fixed_{room_type}_{room_idx}_{start_slot}")
+                    room_intervals[(room_type, room_idx)].append(fixed_interval)
+                    start_slot = slot; current_slot = slot
+            duration = (current_slot - start_slot) + 1
+            fixed_interval = model.NewFixedSizeIntervalVar(start_slot, duration, f"fixed_{room_type}_{room_idx}_{start_slot}")
+            room_intervals[(room_type, room_idx)].append(fixed_interval)
+
+        course_progress_start = 50 + (phase_num - 1) * 40 // total_phases
+        course_progress_end = 50 + phase_num * 40 // total_phases
+        
+        # Process each course in THIS phase
+        for idx, course in enumerate(phase_courses):
+            sessions = self.create_course_sessions(model, course, section_intervals, room_intervals, course['yearLevel'])
+            if sessions is None:
+                logger.error(f"Failed creating sessions for course {course['courseCode']} Year {course['yearLevel']}")
+                return None
+            phase_sessions.extend(sessions)
+            progress = course_progress_start + int((idx + 1) / len(phase_courses) * (course_progress_end - course_progress_start))
+            self.update_progress(progress)
+        
+        # Add hard constraints
+        for intervals in section_intervals.values():
+            if intervals: model.AddNoOverlap(intervals)
+        for intervals in room_intervals.values():
+            if intervals: model.AddNoOverlap(intervals)
+        self.add_room_consistency(model, phase_sessions)
+        
+        if optimize: self.add_phase_objectives(model, phase_sessions)
+        
+        solver.parameters.max_time_in_seconds = timeout
+        solver.parameters.num_search_workers = 8
+        solver.parameters.log_search_progress = True
+        status = solver.Solve(model)
+        
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            logger.warning(f"Solver finished phase {phase_num} with status: {solver.StatusName(status)}")
+            return None
+            
+        phase_schedule = self.extract_phase_solution(solver, phase_sessions)
+        self.update_occupancy_from_schedule(phase_schedule)
+        logger.info(f"Phase {phase_num} (Year {year_level}) completed: {len(phase_schedule)} sessions scheduled")
+        return phase_schedule
+    
+    def create_course_sessions(self, model, course, section_intervals, room_intervals, year_level):
+        """
+        Create variables and constraints for one course.
+        Pairs blocks for lectures if course is 1st year or GEC.
+        """
+        code = course["courseCode"]; title = course["title"]; prog = course["program"]
+        yr = year_level; lec_u = course["unitsLecture"]; lab_u = course["unitsLab"]
+        num_blocks = course.get("blocks", 1)
+        block_letters = [chr(ord('A') + b) for b in range(num_blocks)]
+
+        all_sessions = []
+        processed_blocks_indices = set()
+
+        # --- Lecture Session Handling ---
+        if lec_u > 0:
+            is_shareable_lecture = (yr == 1 or code.startswith("GEC"))
+            for i in range(0, num_blocks, 2):
+                if i in processed_blocks_indices: continue
+                blk1_letter = block_letters[i]
+                if is_shareable_lecture and (i + 1) < num_blocks:
+                    blk2_letter = block_letters[i+1]
+                    logger.debug(f"Creating SHARED lecture for {code} blocks {blk1_letter}+{blk2_letter}")
+                    shared_sessions = self.create_shared_lecture_session(model, course, blk1_letter, blk2_letter, section_intervals, room_intervals)
+                    if shared_sessions is None: return None
+                    all_sessions.extend(shared_sessions)
+                    processed_blocks_indices.add(i); processed_blocks_indices.add(i+1)
+                else:
+                    logger.debug(f"Creating INDIVIDUAL lecture for {code} block {blk1_letter}")
+                    individual_session = self.create_individual_session(model, course, blk1_letter, 'lecture', lec_u, 2, section_intervals, room_intervals, is_lab=False)
+                    if individual_session is None: return None
+                    all_sessions.extend(individual_session)
+                    processed_blocks_indices.add(i)
+
+        # --- Lab Session Handling (Always Individual) ---
+        if lab_u > 0:
+            for i in range(num_blocks):
+                blk_letter = block_letters[i]
+                logger.debug(f"Creating INDIVIDUAL lab for {code} block {blk_letter}")
+                lab_sessions = self.create_individual_session(model, course, blk_letter, 'lab', lab_u * 2, 3, section_intervals, room_intervals, is_lab=True)
+                if lab_sessions is None: return None
+                all_sessions.extend(lab_sessions)
+                
+        return all_sessions
+
+    def create_shared_lecture_session(self, model, course, blk1, blk2,
+                                     section_intervals, room_intervals):
+        """Creates ONE set of variables for a lecture shared by two blocks,
+           enforcing the SAME room for all hours of this shared lecture."""
+        code = course["courseCode"]; title = course["title"]; prog = course["program"]
+        yr = course["yearLevel"]; lec_u = course["unitsLecture"]; duration = 2
+        sess_type = 'lecture'
+        section_key1 = (prog, yr, blk1); section_key2 = (prog, yr, blk2)
+        
+        available_starts = self.get_available_time_slots(section_key1, duration, is_lab=False, max_slots=300)
+        if not available_starts:
+            logger.warning(f"No initial slots for shared lecture {code} blocks {blk1}+{blk2}, checking section {blk2}")
+            available_starts = self.get_available_time_slots(section_key2, duration, is_lab=False, max_slots=300)
+            if not available_starts:
+                 logger.warning(f"No available slots for shared lecture {code} blocks {blk1}+{blk2}. Falling back to all slots.")
+                 available_starts = list(range(self.total_inc - duration + 1))
+                 if not available_starts:
+                     logger.error(f"FATAL: No possible time slots exist for shared lecture {code} {blk1}+{blk2}")
+                     return None
+
+        all_room_indices = self.get_year_level_room_indices(yr, sess_type)
+        if not all_room_indices:
+            logger.error(f"No lecture rooms defined for shared session {code}")
+            return None
+
+        shared_sessions_output = []
+        day_vars = []
+        
+        # --- Room Variable Modification ---
+        shared_rv = model.NewIntVarFromDomain(
+            cp_model.Domain.FromValues(all_room_indices), 
+            f"SHARED_{code}_{blk1}_{blk2}_room" 
+        )
+        # --- End Room Variable Modification ---
+        
+        for i in range(lec_u): 
+            shared_session_id = self._get_next_schedule_id() 
+            
+            # --- Create SHARED time/day variables PER HOUR ---
+            domain_values = available_starts[:min(len(available_starts), 200)]
+            if not domain_values:
+                logger.error(f"Ran out of domain values for shared start time {code} {blk1}+{blk2} session {i+1}")
+                return None
+            s = model.NewIntVarFromDomain(cp_model.Domain.FromValues(domain_values), f"SHARED_{code}_{blk1}_{blk2}_{i}_s")
+            e = model.NewIntVar(duration, self.total_inc, f"SHARED_{code}_{blk1}_{blk2}_{i}_e")
+            dvar = model.NewIntVar(0, len(self.days) - 1, f"SHARED_{code}_{blk1}_{blk2}_{i}_d")
+            
+            # --- REUSE the shared room variable ---
+            rv = shared_rv 
+
+            # Shared constraints
+            model.Add(e == s + duration)
+            model.Add(s >= dvar * self.inc_day)
+            model.Add(s < (dvar + 1) * self.inc_day)
+            day_vars.append(dvar) 
+
+            # Create ONE set of optional room intervals PER HOUR linked to the SHARED room variable
+            for r_idx in all_room_indices:
+                lit = model.NewBoolVar(f"SHARED_use_{shared_session_id}_hr{i}_room_{r_idx}")
+                model.Add(rv == r_idx).OnlyEnforceIf(lit) 
+                model.Add(rv != r_idx).OnlyEnforceIf(lit.Not())
+                opt_iv = model.NewOptionalIntervalVar(s, duration, e, lit, f"SHARED_opt_iv_room_{shared_session_id}_hr{i}_{r_idx}")
+                room_intervals[(sess_type, r_idx)].append(opt_iv)
+
+            # Create TWO section intervals PER HOUR, linked to the shared start/duration
+            iv_section1 = model.NewIntervalVar(s, duration, e, f"iv_sec_{shared_session_id}_hr{i}_{blk1}")
+            iv_section2 = model.NewIntervalVar(s, duration, e, f"iv_sec_{shared_session_id}_hr{i}_{blk2}")
+            section_intervals[section_key1].append(iv_section1)
+            section_intervals[section_key2].append(iv_section2)
+
+            # Append TWO session dicts PER HOUR, pointing to shared variables
+            base_session_data = {'code': code, 'title': title, 'prog': prog, 'yr': yr, 'type': sess_type,
+                                 'start': s, 'end': e, 'room': rv, 'day': dvar, 'duration': duration}
+            shared_sessions_output.append({'id': f"{shared_session_id}-A", 'blk': blk1, **base_session_data})
+            shared_sessions_output.append({'id': f"{shared_session_id}-B", 'blk': blk2, **base_session_data})
+
+        if len(day_vars) > 1:
+            self.add_block_day_constraints(model, day_vars, f"SHARED_{code}", f"{blk1}+{blk2}", is_lab=False)
+
+        return shared_sessions_output
+
+    def create_individual_session(self, model, course, blk, sess_type,
+                                 units, duration, section_intervals,
+                                 room_intervals, is_lab=False):
+        """Creates variables for sessions for a single block (non-shared)."""
+        code = course["courseCode"]; title = course["title"]; prog = course["program"]; yr = course["yearLevel"]
+        section_key = (prog, yr, blk)
+        sessions = []; day_vars = []
+        
+        available_starts = self.get_available_time_slots(section_key, duration, is_lab, max_slots=300)
+        if not available_starts:
+            logger.warning(f"No available slots for individual session {code} {sess_type} {blk}. Falling back.")
+            available_starts = self.lab_starts if is_lab else list(range(self.total_inc - duration + 1))
+            if not available_starts:
+                logger.error(f"FATAL: No possible time slots exist for individual session {code} {sess_type} {blk}")
+                return None
+                
+        all_room_indices = self.get_year_level_room_indices(yr, sess_type)
+        if not all_room_indices:
+            logger.error(f"No rooms of type '{sess_type}' defined for individual session {code} {blk}")
+            return None
+
+        for i in range(units):
+            session_id = self._get_next_schedule_id()
+            domain_values = available_starts[:min(len(available_starts), 200)]
+            if not domain_values:
+                 logger.error(f"Ran out of domain values for start time {code} {sess_type} {blk} session {i+1}")
+                 return None
+            s = model.NewIntVarFromDomain(cp_model.Domain.FromValues(domain_values), f"{code}_{sess_type}_{blk}_{i}_s")
+            e = model.NewIntVar(duration, self.total_inc, f"{code}_{sess_type}_{blk}_{i}_e")
+            dvar = model.NewIntVar(0, len(self.days) - 1, f"{code}_{sess_type}_{blk}_{i}_d")
+            rv = model.NewIntVarFromDomain(cp_model.Domain.FromValues(all_room_indices), f"{code}_{sess_type}_{blk}_{i}_room")
+            
+            model.Add(e == s + duration); model.Add(s >= dvar * self.inc_day); model.Add(s < (dvar + 1) * self.inc_day)
+            day_vars.append(dvar)
+
+            iv_section = model.NewIntervalVar(s, duration, e, f"iv_sec_{session_id}")
+            section_intervals[section_key].append(iv_section)
+            
+            for r_idx in all_room_indices:
+                lit = model.NewBoolVar(f"use_{session_id}_room_{r_idx}")
+                model.Add(rv == r_idx).OnlyEnforceIf(lit); model.Add(rv != r_idx).OnlyEnforceIf(lit.Not())
+                opt_iv = model.NewOptionalIntervalVar(s, duration, e, lit, f"opt_iv_room_{session_id}_{r_idx}")
+                room_intervals[(sess_type, r_idx)].append(opt_iv)
+            
+            sessions.append({'id': session_id, 'code': code, 'title': title, 'prog': prog, 'yr': yr, 'blk': blk,
+                             'type': sess_type, 'start': s, 'end': e, 'room': rv, 'day': dvar, 'duration': duration})
+
+        if len(day_vars) > 1: self.add_block_day_constraints(model, day_vars, code, blk, is_lab)
+        return sessions
+    
+    def add_block_day_constraints(self, model, day_vars, name_prefix, blk, is_lab):
+        max_per_day = 2 if is_lab else 1
+        for d in range(len(self.days)):
+            day_bools = []
+            for i, dv in enumerate(day_vars):
+                b = model.NewBoolVar(f"{name_prefix}_{blk}_day{d}_sess{i}")
+                model.Add(dv == d).OnlyEnforceIf(b); model.Add(dv != d).OnlyEnforceIf(b.Not())
+                day_bools.append(b)
+            model.Add(sum(day_bools) <= max_per_day)
+
+    def add_room_consistency(self, model, sessions):
+        by_course_block_type = defaultdict(list)
+        for sess in sessions:
+            key = (sess['code'], sess['prog'], sess['yr'], sess['blk'], sess['type'])
+            # Only apply consistency to *individual* sessions here
+            if isinstance(sess['id'], int): 
+                 by_course_block_type[key].append(sess['room'])
+
+        for room_vars in by_course_block_type.values():
+            if len(room_vars) > 1:
+                first_room_var = room_vars[0]
+                for other_room_var in room_vars[1:]: model.Add(other_room_var == first_room_var)
+
+    def add_phase_objectives(self, model, sessions):
+        objectives = []
+        program_year_block_days = defaultdict(list)
+        unique_session_vars = {} 
+        for sess in sessions:
+            session_key = sess['id'] 
+            if session_key not in unique_session_vars:
+                 program_year_block_days[(sess['prog'], sess['yr'], sess['blk'])].append(sess['day'])
+                 unique_session_vars[session_key] = sess['day']
+
+        for key, days in program_year_block_days.items():
+            if len(days) > 1:
+                prog, yr, blk = key
+                min_day = model.NewIntVar(0, len(self.days) - 1, f"min_day_{prog}{yr}{blk}")
+                max_day = model.NewIntVar(0, len(self.days) - 1, f"max_day_{prog}{yr}{blk}")
+                model.AddMinEquality(min_day, days); model.AddMaxEquality(max_day, days)
+                day_span = model.NewIntVar(0, len(self.days) - 1, f"day_span_{prog}{yr}{blk}")
+                model.Add(day_span == max_day - min_day)
+                objectives.append(day_span)
+        if objectives: model.Minimize(sum(objectives))
+
+    def extract_phase_solution(self, solver, sessions):
+        schedule = []
+        for sess in sessions:
+            try:
+                room_idx = solver.Value(sess['room']); day_idx = solver.Value(sess['day']); start_val = solver.Value(sess['start'])
+                offs = start_val % self.inc_day; hr = self.start_t + offs / self.inc_hr
+                m1 = int((hr - int(hr)) * 60); t1 = f"{int(hr)%12 or 12}:{m1:02d} {'AM' if hr<12 else 'PM'}"
+                hr2 = hr + sess['duration'] / self.inc_hr
+                m2 = int((hr2 - int(hr2)) * 60); t2 = f"{int(hr2)%12 or 12}:{m2:02d} {'AM' if hr2<12 else 'PM'}"
+                display_code = sess['code']
+                if sess['code'] in self.courses_with_both: display_code = f"{sess['code']}A" if sess['type'] == 'lecture' else f"{sess['code']}L"
+
+                schedule.append({'schedule_id': sess['id'], 'courseCode': display_code, 'baseCourseCode': sess['code'],
+                                 'title': sess['title'], 'program': sess['prog'], 'year': sess['yr'],
+                                 'session': 'Lecture' if sess['type'] == 'lecture' else 'Laboratory',
+                                 'block': sess['blk'], 'day': self.days[day_idx], 'period': f"{t1} - {t2}",
+                                 'room': self.rooms[sess['type']][room_idx],
+                                 '_start_slot': start_val, '_duration': sess['duration'],
+                                 '_room_type': sess['type'], '_room_idx': room_idx })
+            except Exception as e:
+                 logger.error(f"Error extracting solution for session {sess.get('id', 'N/A')}: {e}")
+                 continue
+        return schedule
+    
+    def update_occupancy_from_schedule(self, schedule):
+        for event in schedule:
+            section_key = (event['program'], event['year'], event['block'])
+            room_key = (event['_room_type'], event['_room_idx'])
+            start_slot = event['_start_slot']; duration = event['_duration']
+            slots = set(range(start_slot, start_slot + duration))
+            self.section_occupied[section_key].update(slots)
+            self.occupied_slots[room_key].update(slots)
+            
+    def solve(self):
+        self.update_progress(52)
+        phases = defaultdict(list); phase_years = {}
+        for phase, course in self.all_courses:
+            phases[phase].append(course)
+            phase_years[phase] = course['yearLevel']
+        total_phases = len(phases); combined_schedule = []
+        for phase_num, phase in enumerate(sorted(phases.keys(), key=lambda p: p.value), 1):
+            phase_courses = phases[phase]; year_level = phase_years[phase]
+            phase_schedule = self.solve_phase(phase_courses, phase_num, total_phases, year_level)
+            if phase_schedule is None:
+                logger.error(f"Failed to schedule phase {phase_num} (Year {year_level})")
+                self.update_progress(-1); return "impossible"
+            combined_schedule.extend(phase_schedule)
+        combined_schedule.sort(key=lambda x: (self.days.index(x['day']), x['_start_slot']))
+        for event in combined_schedule:
+            del event['_start_slot']; del event['_duration']; del event['_room_type']; del event['_room_idx']
+        self.update_progress(95)
+        return combined_schedule
+
+# --- Main entry point ---
+def generate_schedule(process_id=None):
+    try:
+        scheduler = HierarchicalScheduler(process_id)
+        scheduler.load_data()
+        schedule = scheduler.solve()
+        if schedule == "impossible":
+            logger.error("Schedule generation resulted in impossible configuration")
+            return "impossible"
+        schedule_dict.clear()
+        schedule_dict.update({e['schedule_id']: e for e in schedule})
+        if process_id: progress_state[process_id] = 100
+        logger.info(f"Successfully generated schedule with {len(schedule)} events")
+        return schedule
+    except Exception as e:
+        logger.exception(f"Error in schedule generation: {str(e)}")
+        if process_id: progress_state[process_id] = -1
+        return "impossible"

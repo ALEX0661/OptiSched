@@ -1,0 +1,669 @@
+//scheduler without the merge function
+
+from ortools.sat.python import cp_model
+from collections import defaultdict
+from app.core.globals import schedule_dict, progress_state
+from app.core.firebase import load_courses, load_rooms, load_time_settings, load_days
+import logging
+import math
+import random # <--- Ensures random is imported
+from typing import List, Dict, Tuple, Set, Optional
+from enum import Enum
+import time
+
+logger = logging.getLogger("schedgeneration")
+
+class SchedulingPhase(Enum):
+    YEAR_1 = 1
+    YEAR_2 = 2
+    YEAR_3 = 3
+    YEAR_4 = 4
+
+class HierarchicalScheduler:
+    """
+    Year-level hierarchical scheduler. All rooms are accessible to all year levels.
+    """
+    
+    def __init__(self, process_id=None):
+        self.process_id = process_id
+        self.all_courses = []
+        self.rooms = {} # Will store {'lecture': [...], 'lab': [...]}
+        self.time_settings = {}
+        self.days = []
+        
+        # REMOVED: Year-specific room pools (year_1_rooms, year_2_rooms, upper_year_rooms)
+        
+        # Time parameters
+        self.start_t = 0
+        self.end_t = 0
+        self.inc_hr = 2
+        self.inc_day = 0
+        self.total_inc = 0
+        self.lab_starts = []
+        
+        # Schedule tracking across phases
+        self.global_schedule = []
+        self.occupied_slots = defaultdict(set) # Tracks (room_type, room_idx) -> set of occupied time slots
+        self.section_occupied = defaultdict(set) # Tracks (program, year, block) -> set of occupied time slots
+        
+        self.schedule_id = 1
+        self.phase_stats = {}
+        
+        # Track courses with both lecture and lab units
+        self.courses_with_both = set()
+        
+    def update_progress(self, value):
+        """Update progress state if process_id exists"""
+        if self.process_id:
+            progress_state[self.process_id] = value
+            
+    # REMOVED: allocate_rooms_to_years function - No longer needed
+    
+    def get_year_level_room_indices(self, year_level, room_type):
+        """
+        MODIFIED: Returns indices for ALL rooms of the specified type.
+        Year level is no longer used to restrict room access.
+        """
+        all_rooms_of_type = self.rooms.get(room_type, [])
+        # Return indices [0, 1, 2, ..., N-1] for N rooms
+        return list(range(len(all_rooms_of_type)))
+
+    def load_data(self):
+        """Load and prepare all necessary data"""
+        self.update_progress(5)
+        
+        courses = load_courses()
+        self.all_courses = self.prioritize_and_partition_courses(courses)
+        self.update_progress(15)
+        
+        self.rooms = load_rooms()
+        # Shuffle rooms once at the beginning for better distribution potentially
+        for room_type in self.rooms:
+             random.shuffle(self.rooms[room_type])
+        self.update_progress(25)
+        
+        # REMOVED: Call to self.allocate_rooms_to_years()
+        self.update_progress(30) # Keep progress step for consistency
+        
+        self.time_settings = load_time_settings()
+        self.update_progress(35)
+        
+        self.days = load_days()
+        self.update_progress(45)
+        
+        self.setup_time_parameters()
+        self.update_progress(50)
+        
+    def prioritize_and_partition_courses(self, courses):
+        """
+        Partition courses by year level, then by complexity within each year.
+        Returns list of (phase, course) tuples sorted by year then priority.
+        (No changes needed here)
+        """
+        scored_courses = []
+        
+        # Group by year level first
+        year_courses = defaultdict(list)
+        
+        for course in courses:
+            # Track courses with both lecture and lab units
+            has_lecture = course.get('unitsLecture', 0) > 0
+            has_lab = course.get('unitsLab', 0) > 0
+            if has_lecture and has_lab:
+                self.courses_with_both.add(course['courseCode'])
+            
+            year_level = course['yearLevel']
+            
+            # Calculate complexity score within year
+            # Prioritize: lecture-only first, then single-block, then multi-block
+            priority_score = (
+                (0 if not has_lab else 1000) +  # Lecture-only courses first
+                course.get('blocks', 1) * 100 +   # Fewer blocks first
+                (course.get('unitsLecture', 0) + course.get('unitsLab', 0)) * 10
+            )
+            
+            year_courses[year_level].append((priority_score, course))
+        
+        # Create phases by year level
+        result = []
+        phase_map = {
+            1: SchedulingPhase.YEAR_1,
+            2: SchedulingPhase.YEAR_2,
+            3: SchedulingPhase.YEAR_3,
+            4: SchedulingPhase.YEAR_4
+        }
+        
+        # Sort each year's courses by priority (easiest first)
+        for year_level in sorted(year_courses.keys()):
+            phase = phase_map.get(year_level, SchedulingPhase.YEAR_1)
+            courses_list = year_courses[year_level]
+            
+            # Sort by priority: simpler courses first
+            courses_list.sort(key=lambda x: x[0])
+            
+            for _, course in courses_list:
+                result.append((phase, course))
+        
+        return result
+    
+    def setup_time_parameters(self):
+        """Setup time discretization parameters (No changes needed here)"""
+        self.start_t = self.time_settings["start_time"]
+        self.end_t = self.time_settings["end_time"]
+        self.inc_hr = 2
+        self.inc_day = (self.end_t - self.start_t) * self.inc_hr
+        self.total_inc = self.inc_day * len(self.days)
+        
+        self.lab_starts = []
+        for d in range(len(self.days)):
+            base = d * self.inc_day
+            self.lab_starts.extend(range(base, base + self.inc_day - 2))
+    
+    def get_available_time_slots(self, section_key, duration, is_lab=False, max_slots=500):
+        """
+        Get available time slots that don't conflict with existing schedule for the SECTION.
+        Returns list of valid start times, limited to max_slots for solver efficiency.
+        (No changes needed here)
+        """
+        occupied = self.section_occupied.get(section_key, set())
+        available_starts = []
+        
+        search_space = self.lab_starts if is_lab else range(self.total_inc - duration + 1)
+        
+        for start in search_space:
+            slots_needed = set(range(start, start + duration))
+            if not slots_needed.intersection(occupied):
+                available_starts.append(start)
+                if len(available_starts) >= max_slots:
+                    break
+        
+        return available_starts
+    
+    # REMOVED: get_available_rooms function - Was not used and logic replaced by simplified get_year_level_room_indices
+    
+    def get_phase_timeout(self, phase_num, total_phases, phase_difficulty):
+        """Calculate timeout for phase based on difficulty (No changes needed here)"""
+        base_times = [120, 180, 240, 300] # Base seconds per phase
+        # Let's increase the base time slightly due to more room options
+        base_times = [t * 1.2 for t in base_times] 
+        
+        if phase_num <= len(base_times):
+            timeout = base_times[phase_num - 1]
+        else:
+            timeout = 360 # Increased default
+        
+        # Make timeout dependent on difficulty, minimum 60s
+        return max(60, int(timeout * phase_difficulty)) 
+    
+    def calculate_phase_difficulty(self, phase_courses):
+        """Estimate phase difficulty (0.5 to 2.0) (No changes needed here)"""
+        if not phase_courses:
+            return 0.5
+        
+        total_units = sum(
+            c.get('unitsLecture', 0) + c.get('unitsLab', 0) * 2 # Lab units take more time/resources
+            for c in phase_courses
+        )
+        total_blocks = sum(c.get('blocks', 1) for c in phase_courses)
+        
+        avg_units = total_units / len(phase_courses) if phase_courses else 0
+        avg_blocks = total_blocks / len(phase_courses) if phase_courses else 0
+        
+        # Difficulty scales with average units and blocks per course
+        difficulty = (avg_units / 5.0) * (avg_blocks / 1.5) 
+        return max(0.5, min(2.0, difficulty)) # Clamp between 0.5 and 2.0
+    
+    def solve_phase(self, phase_courses, phase_num, total_phases, year_level):
+        """
+        Solve scheduling for a single phase (year level).
+        Uses feasibility-first approach with soft objectives.
+        (No changes needed here)
+        """
+        if not phase_courses:
+            return []
+        
+        phase_difficulty = self.calculate_phase_difficulty(phase_courses)
+        timeout = self.get_phase_timeout(phase_num, total_phases, phase_difficulty)
+        
+        logger.info(f"Phase {phase_num}/{total_phases} (Year {year_level}): Processing {len(phase_courses)} courses (difficulty: {phase_difficulty:.2f}, timeout: {timeout}s)")
+        
+        # Attempt 1: Strict feasibility
+        result = self._solve_phase_attempt(
+            phase_courses, phase_num, total_phases, 
+            timeout, optimize=False, year_level=year_level
+        )
+        
+        if result is not None:
+            logger.info(f"Phase {phase_num} (Year {year_level}) completed (feasibility mode)")
+            return result
+        
+        # Attempt 2: With optimization (give it more time)
+        logger.warning(f"Phase {phase_num} (Year {year_level}) feasibility failed, retrying with objectives...")
+        result = self._solve_phase_attempt(
+            phase_courses, phase_num, total_phases, 
+            int(timeout * 1.5), optimize=True, year_level=year_level # Increased timeout multiplier
+        )
+        
+        if result is not None:
+            logger.info(f"Phase {phase_num} (Year {year_level}) completed (optimization mode)")
+            return result
+        
+        logger.error(f"Phase {phase_num} (Year {year_level}) failed completely")
+        return None
+    
+    def _solve_phase_attempt(self, phase_courses, phase_num, total_phases, 
+                            timeout, optimize=True, year_level=1):
+        """Internal method to attempt solving a phase (Bug fix remains)"""
+        model = cp_model.CpModel()
+        solver = cp_model.CpSolver()
+        
+        phase_sessions = []
+        section_intervals = defaultdict(list)
+        room_intervals = defaultdict(list) # Key: (room_type, room_idx)
+        
+        # Add fixed intervals for already occupied slots from PREVIOUS phases
+        for (room_type, room_idx), slots in self.occupied_slots.items():
+            if not slots: continue
+            sorted_slots = sorted(list(slots))
+            start_slot = sorted_slots[0]
+            current_slot = sorted_slots[0]
+            for slot in sorted_slots[1:]:
+                if slot == current_slot + 1:
+                    current_slot = slot
+                else:
+                    duration = (current_slot - start_slot) + 1
+                    fixed_interval = model.NewFixedSizeIntervalVar(
+                        start_slot, duration, f"fixed_{room_type}_{room_idx}_{start_slot}"
+                    )
+                    room_intervals[(room_type, room_idx)].append(fixed_interval)
+                    start_slot = slot
+                    current_slot = slot
+            duration = (current_slot - start_slot) + 1
+            fixed_interval = model.NewFixedSizeIntervalVar(
+                start_slot, duration, f"fixed_{room_type}_{room_idx}_{start_slot}"
+            )
+            room_intervals[(room_type, room_idx)].append(fixed_interval)
+        
+        # --- Progress tracking setup ---
+        course_progress_start = 50 + (phase_num - 1) * 40 // total_phases
+        course_progress_end = 50 + phase_num * 40 // total_phases
+        
+        # Process each course in THIS phase
+        for idx, course in enumerate(phase_courses):
+            # Pass the correct year_level to create_course_sessions
+            sessions = self.create_course_sessions( 
+                model, course, section_intervals, room_intervals, course['yearLevel'] 
+            )
+            if sessions is None:
+                logger.error(f"Failed creating sessions for course {course['courseCode']} Year {course['yearLevel']}")
+                return None # Indicate failure if session creation fails
+            
+            phase_sessions.extend(sessions)
+            
+            # Update progress
+            progress = course_progress_start + int((idx + 1) / len(phase_courses) * (course_progress_end - course_progress_start))
+            self.update_progress(progress)
+        
+        # Add hard constraints: No overlap for sections
+        for intervals in section_intervals.values():
+            if intervals:
+                model.AddNoOverlap(intervals)
+        
+        # Add hard constraints: No overlap for rooms (includes fixed intervals from previous phases)
+        for intervals in room_intervals.values():
+            if intervals:
+                model.AddNoOverlap(intervals)
+        
+        # Add same-room constraint (within a course block)
+        self.add_room_consistency(model, phase_sessions)
+        
+        # Add soft objectives if optimizing
+        if optimize:
+            self.add_phase_objectives(model, phase_sessions)
+        
+        # Configure solver
+        solver.parameters.max_time_in_seconds = timeout
+        solver.parameters.num_search_workers = 8 # Use multiple cores if available
+        solver.parameters.log_search_progress = True
+        
+        # Solve the model
+        status = solver.Solve(model)
+        
+        # Check if a solution was found
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            logger.warning(f"Solver finished phase {phase_num} with status: {solver.StatusName(status)}")
+            return None # Indicate failure
+        
+        # Extract solution
+        phase_schedule = self.extract_phase_solution(solver, phase_sessions)
+        self.update_occupancy_from_schedule(phase_schedule) # IMPORTANT: Update global state
+        
+        logger.info(f"Phase {phase_num} (Year {year_level}) completed: {len(phase_schedule)} sessions scheduled")
+        return phase_schedule
+    
+    def create_course_sessions(self, model, course, section_intervals, room_intervals, year_level):
+        """Create variables and constraints for one course (Pass year_level)"""
+        code = course["courseCode"]
+        title = course["title"]
+        prog = course["program"]
+        # yr = course["yearLevel"] # Use passed year_level instead
+        yr = year_level
+        lec_u = course["unitsLecture"]
+        lab_u = course["unitsLab"]
+        blocks = course.get("blocks", 1)
+        
+        all_sessions = []
+        
+        for b in range(blocks):
+            blk = chr(ord('A') + b)
+            section_key = (prog, yr, blk)
+            
+            # Process lectures
+            if lec_u > 0:
+                sessions = self.create_session_type(
+                    model, code, prog, yr, blk, 'lecture', lec_u, 2, title, # Duration 2 = 1hr
+                    section_key, section_intervals, room_intervals, is_lab=False
+                )
+                if sessions is None: return None
+                all_sessions.extend(sessions)
+            
+            # Process labs
+            if lab_u > 0:
+                sessions = self.create_session_type(
+                    model, code, prog, yr, blk, 'lab', lab_u * 2, 3, title, # Duration 3 = 1.5hr
+                    section_key, section_intervals, room_intervals, is_lab=True
+                )
+                if sessions is None: return None
+                all_sessions.extend(sessions)
+        
+        return all_sessions
+    
+    def create_session_type(self, model, code, prog, yr, blk, sess_type, 
+                           units, duration, title, section_key,
+                           section_intervals, room_intervals, is_lab=False):
+        """Create variables for sessions of one type (lecture or lab) (MODIFIED Room Access)"""
+        sessions = []
+        day_vars = []
+        start_vars = []
+        
+        # Get available time slots for the section
+        available_starts = self.get_available_time_slots(
+            section_key, duration, is_lab, max_slots=300 # Limit domain size for performance
+        )
+        
+        if not available_starts:
+            logger.warning(f"No available slots for section {section_key} - {code} {sess_type}")
+            # Fallback if no specific slots free for section (might still fail later on room conflict)
+            available_starts = self.lab_starts if is_lab else list(range(self.total_inc - duration + 1))
+            if not available_starts: 
+                logger.error(f"FATAL: No possible time slots exist at all for {code} {sess_type}")
+                return None 
+        
+        # MODIFIED: Get ALL available rooms of the correct type
+        all_room_indices = self.get_year_level_room_indices(yr, sess_type) # yr is now unused here but kept for signature consistency
+        
+        if not all_room_indices:
+            logger.error(f"No rooms of type '{sess_type}' are defined.")
+            return None
+        
+        for i in range(units): # For each required hour/session
+            session_id = self.schedule_id
+            self.schedule_id += 1
+            
+            # Start time variable (domain limited for performance)
+            domain_values = available_starts[:min(len(available_starts), 200)] 
+            if not domain_values:
+                 logger.error(f"Ran out of domain values for start time for {code} {sess_type} {blk} session {i+1}")
+                 return None # No possible start times left
+                 
+            s = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(domain_values),
+                f"{code}_{sess_type}_{blk}_{i}_s"
+            )
+            
+            # End time
+            e = model.NewIntVar(duration, self.total_inc, f"{code}_{sess_type}_{blk}_{i}_e")
+            model.Add(e == s + duration)
+            
+            # Day variable
+            dvar = model.NewIntVar(0, len(self.days) - 1, f"{code}_{sess_type}_{blk}_{i}_d")
+            model.Add(s >= dvar * self.inc_day)
+            model.Add(s < (dvar + 1) * self.inc_day)
+            
+            # Room variable - Can use ANY room of the correct type
+            rv = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(all_room_indices),
+                f"{code}_{sess_type}_{blk}_{i}_room"
+            )
+            
+            # Interval for section overlap check
+            iv_section = model.NewIntervalVar(s, duration, e, f"iv_sec_{session_id}")
+            section_intervals[section_key].append(iv_section)
+            
+            # Optional intervals for room overlap check
+            # One optional interval per possible room this session could use
+            for r_idx in all_room_indices:
+                # Literal: True if this session uses room r_idx
+                lit_uses_room = model.NewBoolVar(f"use_{session_id}_room_{r_idx}")
+                model.Add(rv == r_idx).OnlyEnforceIf(lit_uses_room)
+                model.Add(rv != r_idx).OnlyEnforceIf(lit_uses_room.Not())
+                
+                # Optional interval: Active only if lit_uses_room is True
+                opt_iv_room = model.NewOptionalIntervalVar(
+                    s, duration, e, lit_uses_room, f"opt_iv_room_{session_id}_{r_idx}"
+                )
+                # Add this optional interval to the list for the specific room
+                room_intervals[(sess_type, r_idx)].append(opt_iv_room)
+            
+            sessions.append({
+                'id': session_id,
+                'code': code, 'title': title, 'prog': prog, 'yr': yr, 'blk': blk, 
+                'type': sess_type, 'start': s, 'end': e, 'room': rv, 'day': dvar,
+                'duration': duration
+            })
+            
+            day_vars.append(dvar)
+            start_vars.append(s)
+
+        # Add constraints specific to this block/session_type (e.g., max 1 lecture per day)
+        if len(day_vars) > 1:
+            self.add_block_day_constraints(model, day_vars, code, blk, is_lab)
+        
+        return sessions
+    
+    def add_block_day_constraints(self, model, day_vars, code, blk, is_lab):
+        """Enforce per-day session limits (No changes needed here)"""
+        max_per_day = 2 if is_lab else 1 # Max 2 labs/day, Max 1 lecture/day for same course/block
+        
+        for d in range(len(self.days)):
+            day_bools = []
+            for i, dv in enumerate(day_vars):
+                b = model.NewBoolVar(f"{code}_{blk}_day{d}_sess{i}")
+                model.Add(dv == d).OnlyEnforceIf(b)
+                model.Add(dv != d).OnlyEnforceIf(b.Not())
+                day_bools.append(b)
+            
+            # Sum of bools for this day must be <= max_per_day
+            model.Add(sum(day_bools) <= max_per_day) 
+    
+    def add_room_consistency(self, model, sessions):
+        """Ensure all sessions of same course/block/type use same room (No changes needed here)"""
+        by_course_block_type = defaultdict(list)
+        for sess in sessions:
+            key = (sess['code'], sess['prog'], sess['yr'], sess['blk'], sess['type'])
+            by_course_block_type[key].append(sess['room'])
+        
+        # For each group, force all room variables to be equal to the first one
+        for room_vars in by_course_block_type.values():
+            if len(room_vars) > 1:
+                first_room_var = room_vars[0]
+                for other_room_var in room_vars[1:]:
+                    model.Add(other_room_var == first_room_var)
+    
+    def add_phase_objectives(self, model, sessions):
+        """Add soft optimization objectives for this phase (REMOVED room preference)"""
+        objectives = []
+        
+        # Minimize day spreading per program/year/block
+        program_year_block_days = defaultdict(list)
+        for sess in sessions:
+            program_year_block_days[(sess['prog'], sess['yr'], sess['blk'])].append(sess['day'])
+        
+        for days in program_year_block_days.values():
+            if len(days) > 1:
+                min_day = model.NewIntVar(0, len(self.days) - 1, f"min_day_{random.randint(0,10000)}")
+                max_day = model.NewIntVar(0, len(self.days) - 1, f"max_day_{random.randint(0,10000)}")
+                model.AddMinEquality(min_day, days)
+                model.AddMaxEquality(max_day, days)
+                day_span = model.NewIntVar(0, len(self.days) - 1, f"day_span_{random.randint(0,10000)}")
+                model.Add(day_span == max_day - min_day)
+                # Penalize schedules spreading over many days
+                objectives.append(day_span) 
+        
+        # REMOVED: Penalty for using non-dedicated rooms (they don't exist anymore)
+        
+        # Minimize total objective value if objectives exist
+        if objectives:
+            model.Minimize(sum(objectives))
+    
+    def extract_phase_solution(self, solver, sessions):
+        """Extract solution for this phase (No changes needed here)"""
+        schedule = []
+        
+        for sess in sessions:
+            try:
+                room_idx = solver.Value(sess['room'])
+                day_idx = solver.Value(sess['day'])
+                start_val = solver.Value(sess['start'])
+                
+                # Calculate time strings
+                offs = start_val % self.inc_day
+                hr = self.start_t + offs / self.inc_hr
+                m1 = int((hr - int(hr)) * 60)
+                t1 = f"{int(hr)%12 or 12}:{m1:02d} {'AM' if hr<12 else 'PM'}"
+                
+                hr2 = hr + sess['duration'] / self.inc_hr
+                m2 = int((hr2 - int(hr2)) * 60)
+                t2 = f"{int(hr2)%12 or 12}:{m2:02d} {'AM' if hr2<12 else 'PM'}"
+                
+                # Add A/L suffix if course has both lecture and lab
+                display_code = sess['code']
+                if sess['code'] in self.courses_with_both:
+                    display_code = f"{sess['code']}A" if sess['type'] == 'lecture' else f"{sess['code']}L"
+
+                schedule.append({
+                    'schedule_id': sess['id'],
+                    'courseCode': display_code,
+                    'baseCourseCode': sess['code'], # Keep original code for reference
+                    'title': sess['title'],
+                    'program': sess['prog'],
+                    'year': sess['yr'],
+                    'session': 'Lecture' if sess['type'] == 'lecture' else 'Laboratory',
+                    'block': sess['blk'],
+                    'day': self.days[day_idx],
+                    'period': f"{t1} - {t2}",
+                    'room': self.rooms[sess['type']][room_idx],
+                    # Internal fields used for tracking occupancy
+                    '_start_slot': start_val,
+                    '_duration': sess['duration'],
+                    '_room_type': sess['type'],
+                    '_room_idx': room_idx
+                })
+            except Exception as e:
+                 logger.error(f"Error extracting solution for session {sess.get('id', 'N/A')}: {e}")
+                 # Decide how to handle this - skip this session, return partial, or raise error
+                 # For now, let's skip and log
+                 continue
+
+        return schedule
+    
+    def update_occupancy_from_schedule(self, schedule):
+        """Update global occupancy tracking with newly scheduled sessions (No changes needed here)"""
+        for event in schedule:
+            section_key = (event['program'], event['year'], event['block'])
+            room_key = (event['_room_type'], event['_room_idx'])
+            
+            start_slot = event['_start_slot']
+            duration = event['_duration']
+            slots = set(range(start_slot, start_slot + duration))
+            
+            self.section_occupied[section_key].update(slots)
+            self.occupied_slots[room_key].update(slots)
+    
+    def solve(self):
+        """Main solving method using year-level hierarchical approach (No changes needed here)"""
+        self.update_progress(52)
+        
+        # Partition courses by year level
+        phases = defaultdict(list)
+        phase_years = {}
+        
+        for phase, course in self.all_courses:
+            phases[phase].append(course)
+            # Store the actual year level associated with the phase Enum
+            phase_years[phase] = course['yearLevel'] 
+        
+        total_phases = len(phases)
+        combined_schedule = []
+        
+        # Solve each year level sequentially (Phase 1 first, Phase 4 last)
+        for phase_num, phase in enumerate(sorted(phases.keys(), key=lambda p: p.value), 1):
+            phase_courses = phases[phase]
+            year_level = phase_years[phase] # Get the correct year level for this phase
+            
+            phase_schedule = self.solve_phase(
+                phase_courses, phase_num, total_phases, year_level
+            )
+            
+            if phase_schedule is None:
+                logger.error(f"Failed to schedule phase {phase_num} (Year {year_level})")
+                self.update_progress(-1)
+                return "impossible"
+            
+            combined_schedule.extend(phase_schedule)
+        
+        # Sort final schedule for better readability
+        combined_schedule.sort(key=lambda x: (
+            self.days.index(x['day']),
+            x['_start_slot'] # Use internal start slot for accurate sorting
+        ))
+        
+        # Clean up internal fields before returning
+        for event in combined_schedule:
+            del event['_start_slot']
+            del event['_duration']
+            del event['_room_type']
+            del event['_room_idx']
+        
+        self.update_progress(95)
+        return combined_schedule
+
+
+# --- Main entry point ---
+def generate_schedule(process_id=None):
+    """Main entry point for schedule generation (No changes needed here)"""
+    try:
+        scheduler = HierarchicalScheduler(process_id)
+        
+        scheduler.load_data()
+        schedule = scheduler.solve()
+        
+        if schedule == "impossible":
+            logger.error("Schedule generation resulted in impossible configuration")
+            return "impossible"
+        
+        # Clear previous schedule and update with new one
+        schedule_dict.clear()
+        schedule_dict.update({e['schedule_id']: e for e in schedule})
+        
+        if process_id:
+            progress_state[process_id] = 100 # Signal completion
+        
+        logger.info(f"Successfully generated schedule with {len(schedule)} events")
+        return schedule
+        
+    except Exception as e:
+        logger.exception(f"Error in schedule generation: {str(e)}")
+        if process_id:
+            progress_state[process_id] = -1 # Signal error
+        return "impossible"

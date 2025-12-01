@@ -31,6 +31,7 @@ async def get_schedule(background_tasks: BackgroundTasks,
     logger.info(f"Started schedule generation process_id={process_id}")
     return {"status": "started", "process_id": process_id}
 
+
 @router.get("/status/{process_id}")
 async def get_generation_status(process_id: str):
     """Check the status of a schedule generation process"""
@@ -56,6 +57,7 @@ async def get_generation_status(process_id: str):
             "progress": progress
         }
 
+
 @router.get("/result")
 async def get_generated_schedule():
     """Get the full generated schedule after completion"""
@@ -70,6 +72,7 @@ async def get_generated_schedule():
         "rooms": load_rooms()
     }
 
+
 @router.post("/save")
 async def save_schedule(final_schedule: dict):
     try:
@@ -82,27 +85,8 @@ async def save_schedule(final_schedule: dict):
         raise HTTPException(500, "Internal Server Error in save_schedule")
 
 
-
-@router.get("/final/{schedule_name}")
-async def get_final_schedule(schedule_name: str):
-    try:
-        logger.info("GET /schedule/final/%s called", schedule_name)
-        doc_ref = db.collection("final_schedules").document(schedule_name)
-        doc = doc_ref.get()
-        if not doc.exists:
-            logger.error("Schedule '%s' not found", schedule_name)
-            raise HTTPException(status_code=404, detail="Schedule not found")
-        result = doc.to_dict()
-        logger.info("Schedule retrieved: %s", result)
-        return result
-    except HTTPException as he:
-        logger.error("HTTP error in get_final_schedule: %s", he.detail)
-        raise he
-    except Exception as e:
-        logger.exception("Unexpected error in get_final_schedule")
-        raise HTTPException(status_code=500, detail="Internal Server Error in get_final_schedule")
-
-
+# FIX 2: Moved this endpoint ABOVE the parameterized "/final/{schedule_name}" endpoint
+# This prevents the server from thinking "final" is a schedule name.
 @router.get("/final")
 async def list_final_schedules():
     try:
@@ -117,4 +101,33 @@ async def list_final_schedules():
         raise HTTPException(status_code=500, detail="Internal Server Error in list_final_schedules")
 
 
+@router.get("/final/{schedule_name}")
+async def get_final_schedule(schedule_name: str):
+    try:
+        logger.info("GET /schedule/final/%s called", schedule_name)
+        doc_ref = db.collection("final_schedules").document(schedule_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            logger.error("Schedule '%s' not found", schedule_name)
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        
+        result = doc.to_dict()
 
+        # FIX 3: Re-hydrate the global schedule_dict
+        # This ensures 'Assign Faculty' and 'Override' work immediately after loading.
+        loaded_events = result.get("schedule", [])
+        schedule_dict.clear()
+        for event in loaded_events:
+            s_id = str(event.get("schedule_id"))
+            schedule_dict[s_id] = event
+            
+        logger.info(f"Hydrated schedule_dict with {len(schedule_dict)} events from saved schedule.")
+
+        logger.info("Schedule retrieved: %s", result)
+        return result
+    except HTTPException as he:
+        logger.error("HTTP error in get_final_schedule: %s", he.detail)
+        raise he
+    except Exception as e:
+        logger.exception("Unexpected error in get_final_schedule")
+        raise HTTPException(status_code=500, detail="Internal Server Error in get_final_schedule")

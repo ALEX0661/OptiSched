@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional
+from typing import List
 
 class Faculty(BaseModel):
     id: Optional[int] = None
@@ -13,10 +14,12 @@ class Faculty(BaseModel):
     units: float = 0.0
 
 class AssignmentRequest(BaseModel):
-    schedule_id: int
+    schedule_id: str
     faculty_id: int
+    merged_blocks: Optional[List[str]] = None
 
 class GroupUnassignmentRequest(BaseModel):
     courseCode: str
     program: str
     block: str
+    merged_blocks: Optional[List[str]] = None

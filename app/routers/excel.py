@@ -1,4 +1,4 @@
-from fastapi import APIRouter, File, UploadFile, Depends, HTTPException
+from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query
 import pandas as pd
 import io
 from app.core.auth import verify_token_allowed
@@ -9,13 +9,25 @@ logger = logging.getLogger("excel")
 router = APIRouter(dependencies=[Depends(verify_token_allowed)])
  
 @router.post("/")
-async def upload_excel(file: UploadFile = File(...)):
+async def upload_excel(file: UploadFile = File(...), sheet_name: str = Query(None)):
     try:
         if not file.filename.endswith((".xlsx", ".xls")):
             raise HTTPException(status_code=400, detail="Invalid file format. Please upload an Excel file.")
     
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        
+        # If sheet_name is provided, use it; otherwise read the first sheet
+        if sheet_name:
+            try:
+                df = pd.read_excel(io.BytesIO(contents), sheet_name=sheet_name)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Sheet '{sheet_name}' not found in the Excel file."
+                )
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+        
         courses = []
         for index, row in df.iterrows():
             course = {
