@@ -1,10 +1,31 @@
+import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from app.core.globals import schedule_dict, in_memory_faculty_loads
 
-cred = credentials.ApplicationDefault()
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+# --- UPDATED INITIALIZATION LOGIC ---
+if os.environ.get("FIREBASE_SERVICE_ACCOUNT"):
+    # Production: Load from Railway Variable
+    service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
+    cred = credentials.Certificate(service_account_info)
+else:
+    # Local Development: Fallback to a local file (optional)
+    # If you use 'gcloud auth application-default login' locally, you can keep
+    # credentials.ApplicationDefault() here, or point to a downloaded JSON file.
+    try:
+        cred = credentials.Certificate("serviceAccountKey.json")
+    except Exception:
+        print("Warning: serviceAccountKey.json not found. Attempting Application Default Credentials.")
+        cred = credentials.ApplicationDefault()
+
+try:
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except ValueError:
+    # App already initialized
+    db = firestore.client()
+# -------------------------------------
 
 _courses_cache = None
 _rooms_cache = None
