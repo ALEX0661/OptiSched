@@ -2,15 +2,13 @@ import logging
 import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from app.routers import auth, courses, faculty, schedule, excel, overrides, settings, progress
+from app.routers import courses, faculty, schedule, excel, overrides, settings, progress
 from app.core.firebase import (
     refresh_faculty_cache,
     refresh_courses_cache,
     refresh_rooms_cache,
     refresh_time_settings_cache,
     refresh_days_cache,
-    load_admins_cache,
     get_start_end,
 )
 from app.core.globals import schedule_dict
@@ -25,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OptiSchedule API", version="1.0.0")
+app = FastAPI(title="OptiSchedule API", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +35,8 @@ app.add_middleware(
 
 app.include_router(progress.router)
 app.include_router(settings.router, prefix="/settings", tags=["Settings"])
-app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+
+
 app.include_router(courses.router, prefix="/courses", tags=["Courses"])
 app.include_router(faculty.router, prefix="/faculty", tags=["Faculty"])
 app.include_router(schedule.router, prefix="/schedule", tags=["Schedule"])
@@ -59,7 +58,7 @@ async def startup_event():
     refresh_rooms_cache()
     refresh_time_settings_cache()
     refresh_days_cache()
-    load_admins_cache()
+
 
     for ev in schedule_dict.values():
         if ev.get("period"):

@@ -507,3 +507,55 @@ async def upload_specialization_csv(
     except Exception as e:
         logger.exception("Error processing CSV ranking")
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
+    
+# 1. Endpoint to fetch archived faculty
+@router.get("/archived")
+async def fetch_archived_faculty():
+    try:
+        # Fetch from the 'archived_faculty' collection
+        docs = db.collection("archived_faculty").stream()
+        archived_list = []
+        for doc in docs:
+            data = doc.to_dict()
+            # Ensure ID is included
+            data['id'] = int(doc.id) 
+            archived_list.append(data)
+        
+        return {"status": "success", "faculty": archived_list}
+    except Exception as e:
+        logger.exception("Unexpected error in fetch_archived_faculty")
+        raise HTTPException(status_code=500, detail="Internal Server Error in fetch_archived_faculty")
+
+# 2. Endpoint to restore faculty
+@router.post("/restore/{faculty_id}")
+async def restore_faculty(faculty_id: int):
+    try:
+        archived_ref = db.collection("archived_faculty").document(str(faculty_id))
+        doc = archived_ref.get()
+        
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Archived faculty not found")
+            
+        faculty_data = doc.to_dict()
+        
+        # Reference to active collection
+        active_ref = db.collection("faculty").document(str(faculty_id))
+        
+        # Check if ID already exists in active (rare collision edge case)
+        if active_ref.get().exists:
+             raise HTTPException(status_code=400, detail="Faculty ID collision. A faculty with this ID already exists in active list.")
+
+        batch = db.batch()
+        batch.set(active_ref, faculty_data) # Add to active
+        batch.delete(archived_ref)          # Remove from archive
+        batch.commit()
+        
+        refresh_faculty_cache()
+        
+        return {"status": "success", "message": f"Faculty {faculty_data.get('name')} restored successfully.", "faculty": faculty_data}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.exception("Unexpected error in restore_faculty")
+        raise HTTPException(status_code=500, detail="Internal Server Error in restore_faculty")
+

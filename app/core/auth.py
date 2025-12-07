@@ -1,45 +1,51 @@
-import jwt
-from datetime import datetime, timedelta
 from fastapi import HTTPException, Header
-from app.core.firebase import verify_admin_email
+from firebase_admin import auth
+import logging
 
-SECRET_KEY = "SAAMDEVELOOPERS"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 180
-
-
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def verify_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"Token error: {str(e)}")
-
+# Setup Logger
+logger = logging.getLogger("app.core.auth")
 
 def verify_token_allowed(authorization: str = Header(...)) -> dict:
+    """
+    Verifies the Firebase ID Token provided in the Authorization header.
+    """
+    # 1. Validate Header Existence
     if not authorization:
+        logger.warning("Authentication failed: Missing Authorization header.")
         raise HTTPException(status_code=401, detail="Authorization header missing")
 
+    # 2. Validate Header Format
     try:
         scheme, token = authorization.split()
         if scheme.lower() != "bearer":
+            logger.warning(f"Authentication failed: Invalid scheme '{scheme}'. Expected 'Bearer'.")
             raise HTTPException(status_code=401, detail="Invalid authentication scheme")
-    except Exception:
+    except ValueError:
+        logger.warning("Authentication failed: Invalid header format.")
         raise HTTPException(status_code=401, detail="Invalid authorization header format")
 
-    payload = verify_token(token)
-    email = payload.get("email")
-    if not email or not verify_admin_email(email):
-        raise HTTPException(status_code=403, detail="User not allowed")
+    # 3. Verify Token with Firebase Admin SDK
+    try:
+        decoded_token = auth.verify_id_token(token)
+        email = decoded_token.get("email")
+        
+        # Log successful authentication (useful for audit trails)
+        logger.info(f"User successfully authenticated: {email}")
+        
+        return decoded_token
 
-    return payload
+    except auth.ExpiredIdTokenError:
+        logger.warning("Authentication failed: Token has expired.")
+        raise HTTPException(status_code=401, detail="Token expired")
+        
+    except auth.InvalidIdTokenError:
+        logger.warning("Authentication failed: Invalid ID token provided.")
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
+    except auth.RevokedIdTokenError:
+        logger.warning("Authentication failed: Token has been revoked.")
+        raise HTTPException(status_code=401, detail="Token revoked")
+        
+    except Exception as e:
+        logger.error(f"Critical authentication error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Authentication failed due to internal error")
