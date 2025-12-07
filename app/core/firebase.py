@@ -3,6 +3,7 @@ from firebase_admin import credentials, firestore, auth
 from app.core.globals import schedule_dict, in_memory_faculty_loads
 import os
 import logging
+import json
 
 # Setup Logger
 logger = logging.getLogger("app.core.firebase")
@@ -175,3 +176,4 @@ def refresh_days_cache():
     global _days_cache
 
     _days_cache = None
+
