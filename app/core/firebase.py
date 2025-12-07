@@ -7,20 +7,26 @@ import logging
 # Setup Logger
 logger = logging.getLogger("app.core.firebase")
 
-# Path to service account key
-cred_path = os.path.join(os.path.dirname(__file__), "optisched-6b881-firebase-adminsdk-fbsvc-a719bfc923.json")
-cred = credentials.Certificate(cred_path)
-
-# Initialize Firebase app if not already initialized
-if not firebase_admin._apps:
+if os.environ.get("FIREBASE_SERVICE_ACCOUNT"):
+    # Production: Load from Railway Variable
+    service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
+    cred = credentials.Certificate(service_account_info)
+else:
+    # Local Development: Fallback to a local file (optional)
+    # If you use 'gcloud auth application-default login' locally, you can keep
+    # credentials.ApplicationDefault() here, or point to a downloaded JSON file.
     try:
-        firebase_admin.initialize_app(cred)
-        logger.info("Firebase Admin SDK initialized successfully.")
-    except Exception as e:
-        logger.critical(f"Failed to initialize Firebase Admin SDK: {e}")
-        raise e
+        cred = credentials.Certificate("serviceAccountKey.json")
+    except Exception:
+        print("Warning: serviceAccountKey.json not found. Attempting Application Default Credentials.")
+        cred = credentials.ApplicationDefault()
 
-db = firestore.client()
+try:
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except ValueError:
+    # App already initialized
+    db = firestore.client()
 
 # Caches
 _courses_cache = None 
@@ -167,4 +173,5 @@ def refresh_time_settings_cache():
 
 def refresh_days_cache():
     global _days_cache
+
     _days_cache = None
