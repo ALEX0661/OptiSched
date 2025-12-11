@@ -13,7 +13,7 @@ logger = logging.getLogger("schedgeneration")
 
 # --- PHASES ---
 class SchedulingPhase(Enum):
-    NSTP = 1        # Phase 1: Fri/Sat only
+    NSTP = 1        # Phase 1: Strictly Fri/Sat only
     GEC_MAT = 2     # Phase 2: Strict Mon-Thu Pattern + Timeframes
     MAJORS_Y4 = 3   # Phase 3: Practicum
     MAJORS_Y3 = 4   
@@ -222,22 +222,23 @@ class HierarchicalScheduler:
     def get_valid_domain(self, course, sess_type, duration_slots, occupied_slots, 
                         is_gec, is_nstp, is_pe, is_practicum, practicum_window=None):
         
-        valid_slots_strict = []
-        valid_slots_relaxed = []
+        # We split domains to prioritize Mon-Thu for Y3 Labs, but still allow Fri/Sat if needed.
+        primary_domain = []   # Preferred slots
+        secondary_domain = [] # Fallback slots
         
         # --- Strict Timeframes Setup ---
-        # GEC/MAT: 7:00, 8:30, 10:00, 12:30, 14:00, 15:30, 17:30, 19:00
         gec_strict_offsets = [0, 3, 6, 11, 14, 17, 21, 24]
-        
-        # NSTP: 9:00, 13:00, 15:00
         nstp_strict_offsets = [4, 12, 16]
+        
+        yr = int(course.get('yearLevel', 1))
+        is_y3_lab = (yr == 3 and sess_type == 'lab')
 
         for day_idx in range(len(self.days)):
             base = day_idx * self.slots_per_day
             
-            # --- Day Restrictions ---
-            if is_nstp and day_idx not in [4, 5]: continue # Fri/Sat only
-            if is_gec and day_idx not in [0, 1, 2, 3]: continue # Mon-Thu only
+            # --- STRICT Day Restrictions ---
+            if is_nstp and day_idx not in [4, 5]: continue 
+            if is_gec and day_idx not in [0, 1, 2, 3]: continue 
             
             # --- Practicum Distribution ---
             if is_practicum and practicum_window is not None:
@@ -271,7 +272,7 @@ class HierarchicalScheduler:
                 slot_range = set(range(start_slot, start_slot + duration_slots))
                 if slot_range.intersection(occupied_slots): continue
                 
-                # --- Lunch Logic ---
+                # --- Lunch Logic (Soft Constraint) ---
                 has_lunch_conflict = False
                 for s in range(start_slot, start_slot + duration_slots):
                     day_local_slot = s % self.slots_per_day
@@ -279,13 +280,21 @@ class HierarchicalScheduler:
                         has_lunch_conflict = True
                         break
                 
-                if not has_lunch_conflict:
-                    valid_slots_strict.append(start_slot)
+                # --- DOMAIN SORTING (PRIORITY) ---
+                # Check if this slot belongs in Primary (Preferred) or Secondary (Fallback)
+                
+                is_preferred_day = True
+                if is_y3_lab and day_idx > 3: # If Y3 Lab is on Fri(4) or Sat(5)
+                    is_preferred_day = False
+                
+                if not has_lunch_conflict and is_preferred_day:
+                    primary_domain.append(start_slot)
                 else:
-                    valid_slots_relaxed.append(start_slot)
+                    secondary_domain.append(start_slot)
         
-        combined = valid_slots_strict + valid_slots_relaxed
-        return combined
+        # Return Primary first, then Secondary
+        # This tells the solver: "Try these first. If impossible, try the others."
+        return primary_domain + secondary_domain
 
     def create_course_sessions(self, model, course, section_intervals, room_intervals):
         code = course["courseCode"]
